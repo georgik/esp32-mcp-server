@@ -227,6 +227,7 @@ async fn mcp_server_task(stack: &'static Stack<'static>) {
         let mut tx_buffer = [0; 4096];
         let mut socket = TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(30)));
+        socket.set_keep_alive(Some(Duration::from_secs(10))); // Enable TCP keep-alive
 
         info!("MCP server listening on port {}...", MCP_PORT);
 
@@ -263,7 +264,10 @@ async fn mcp_server_task(stack: &'static Stack<'static>) {
                         }
                     }
                     Err(e) => {
-                        error!("MCP connection error: {:?}", e);
+                        warn!(
+                            "MCP connection error: {:?}. Server will accept new connections.",
+                            e
+                        );
                         // Turn LED back to blue on error too
                         if let Err(e) = LED_CHANNEL.sender().try_send(LedCommand::SetColor {
                             r: 0,
@@ -275,6 +279,9 @@ async fn mcp_server_task(stack: &'static Stack<'static>) {
                         } else {
                             info!("LED set back to blue after connection error");
                         }
+
+                        // Add a small delay before accepting new connections to allow client to reconnect
+                        Timer::after(Duration::from_millis(100)).await;
                     }
                 }
             }
