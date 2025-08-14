@@ -1,0 +1,40 @@
+menu "ESP32-S3 MCP Server Configuration"
+
+    config MCP_PORT
+        int "MCP Server Port"
+        range 1000 65535
+        default 3000
+        help
+            Port number for the MCP (Model Context Protocol) server.
+            Default is 3000 to match the Rust implementation.
+
+    config MCP_KEEPALIVE_IDLE
+        int "TCP keep-alive idle time (seconds)"
+        range 1 3600
+        default 7
+        help
+            Time in seconds before starting keep-alive probes.
+
+    config MCP_KEEPALIVE_INTERVAL  
+        int "TCP keep-alive interval (seconds)"
+        range 1 60
+        default 1
+        help
+            Interval between keep-alive probes.
+
+    config MCP_KEEPALIVE_COUNT
+        int "TCP keep-alive probe count"
+        range 1 10
+        default 3
+        help
+            Number of keep-alive probes before timing out.
+
+    config LED_GPIO
+        int "LED Strip GPIO Number"
+        range 0 48
+        default 8
+        help
+            GPIO number for the addressable LED strip.
+            Default is GPIO8 to match the Rust implementation.
+
+endmenu
