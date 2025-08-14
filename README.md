@@ -79,13 +79,88 @@ Add this to your Warp MCP configuration:
 
 ## Available MCP Tools
 
-The ESP32 MCP server currently provides:
+The ESP32 MCP server provides the following tools:
 
 ### `wifi_status`
 - **Description**: Get WiFi connection status and IP information
 - **Parameters**: 
   - `detailed` (optional boolean): Include detailed connection info
 - **Returns**: Current WiFi status, IP address, signal strength, and connected SSID
+
+### `led_control`
+- **Description**: Control the onboard SmartLED/NeoPixel on GPIO8
+- **Parameters**:
+  - `color` (string): Predefined color name - "red", "green", "blue", "yellow", "magenta", "cyan", "white", "off"
+  - `r` (integer 0-255): Red component for custom RGB colors
+  - `g` (integer 0-255): Green component for custom RGB colors  
+  - `b` (integer 0-255): Blue component for custom RGB colors
+  - `brightness` (integer 0-100): Brightness percentage
+- **Returns**: Confirmation of LED color and brightness settings
+
+### `compute_add`
+- **Description**: Add two floating-point numbers
+- **Parameters**:
+  - `a` (number, required): First number
+  - `b` (number, required): Second number
+- **Returns**: Sum of the two numbers
+
+### `compute_multiply`
+- **Description**: Multiply two floating-point numbers
+- **Parameters**:
+  - `a` (number, required): First number
+  - `b` (number, required): Second number
+- **Returns**: Product of the two numbers
+
+## LED Status Indicators
+
+The ESP32-C6's onboard LED provides visual feedback:
+- 🔵 **Blue (20% brightness)**: System ready, no MCP client connected
+- 🟢 **Green (20% brightness)**: MCP client connected and active
+- ⚫ **Off**: Device not running or LED manually turned off
+
+## Example AI Assistant Prompts
+
+Once connected to Warp with MCP, you can use these natural language prompts:
+
+### LED Control Examples
+```
+"Turn the ESP32 LED red"
+"Set the ESP32 LED to blue with 50% brightness"
+"Change the LED to green and make it dim (20% brightness)"
+"Set the ESP32 LED to RGB(128, 64, 255) with 75% brightness"
+"Make the LED purple using RGB values"
+"Turn off the ESP32 LED"
+```
+
+### WiFi Status Examples
+```
+"Check the WiFi status of my ESP32"
+"Is my ESP32 connected to WiFi?"
+"Show me detailed WiFi information from the ESP32 including signal strength"
+```
+
+### Mathematical Computation Examples
+```
+"Ask the ESP32 to calculate 15.5 + 23.7"
+"Use my ESP32 to add two numbers: 42 and 38"
+"Have the ESP32 multiply 12.5 by 8.2"
+"Calculate 25 × 16 using the ESP32"
+```
+
+### Combined Operations Examples
+```
+"Check my ESP32's WiFi status, then turn the LED green if connected"
+"Set the ESP32 LED to yellow, check WiFi status, then calculate 100 + 200"
+"If my ESP32 is connected to WiFi, turn the LED blue, otherwise turn it red"
+```
+
+### Creative Examples
+```
+"Make the ESP32 LED show different colors to indicate system status"
+"Use the ESP32 LED as a status indicator - green for good WiFi, red for problems"
+"Create a light show on my ESP32 by setting different colors and brightness levels"
+"Set up the ESP32 LED to indicate calculation results with different colors"
+```
 
 ## Architecture
 
