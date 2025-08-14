@@ -170,8 +170,6 @@ Warp Terminal
 ESP32 MCP Bridge (Rust)
     ↓ (TCP JSON-RPC)
 ESP32-C6 MCP Server
-    ↓ (WiFi)
-Router/Network
 ```
 
 The bridge tool handles the protocol translation between Warp's stdin/stdout MCP communication and the ESP32's TCP-based MCP server.
