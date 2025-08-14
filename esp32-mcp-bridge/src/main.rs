@@ -83,7 +83,7 @@ async fn run_bridge(esp32_addr: SocketAddr, timeout_secs: u64) -> Result<(), Bri
         error!("TCP connection failed: {}", e);
         BridgeError::Connection(format!("Failed to connect: {}", e))
     })?;
-    
+
     // Set TCP_NODELAY to reduce latency
     if let Err(e) = esp32_stream.set_nodelay(true) {
         warn!("Failed to set TCP_NODELAY: {}", e);
@@ -124,7 +124,7 @@ async fn run_bridge(esp32_addr: SocketAddr, timeout_secs: u64) -> Result<(), Bri
                             }
                             Err(e) => {
                                 warn!("Invalid JSON from Warp, skipping: {}", e);
-                                
+
                                 // Send error response back to Warp
                                 let error_response = serde_json::json!({
                                     "jsonrpc": "2.0",
@@ -134,7 +134,7 @@ async fn run_bridge(esp32_addr: SocketAddr, timeout_secs: u64) -> Result<(), Bri
                                         "message": "Parse error"
                                     }
                                 });
-                                
+
                                 let response_str = serde_json::to_string(&error_response)?;
                                 stdout.write_all(response_str.as_bytes()).await?;
                                 stdout.write_all(b"\n").await?;
