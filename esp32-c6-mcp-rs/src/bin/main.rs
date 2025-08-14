@@ -7,20 +7,29 @@
 )]
 
 use embassy_executor::Spawner;
-use embassy_net::{Runner, StackResources, tcp::TcpSocket, Stack};
+use embassy_net::{tcp::TcpSocket, Runner, Stack, StackResources};
 use embassy_time::{Duration, Timer};
+use embedded_io_async::{Read, Write};
+use esp32_c6_mcp_rs::mcp::{
+    handle_mcp_request, set_led_sender, LedCommand, McpRequest, MAX_JSON_SIZE,
+};
 use esp_hal::clock::CpuClock;
 use esp_hal::rng::Rng;
 use esp_hal::timer::systimer::SystemTimer;
 use esp_hal::timer::timg::TimerGroup;
 use esp_wifi::{
-    EspWifiController,
     init,
     wifi::{ClientConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState},
+    EspWifiController,
 };
-use log::{info, warn, error};
-use esp32_c6_mcp_rs::mcp::{McpRequest, handle_mcp_request, MAX_JSON_SIZE};
-use embedded_io_async::{Read, Write};
+use log::{error, info, warn};
+
+// SmartLED imports
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use esp_hal::rmt::{ConstChannelAccess, Rmt};
+use esp_hal_smartled::{smart_led_buffer, SmartLedsAdapter};
+use smart_leds::{brightness, gamma, SmartLedsWrite, RGB8};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -29,7 +38,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 
 extern crate alloc;
 use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -37,18 +45,25 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 // When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
 macro_rules! mk_static {
-    ($t:ty,$val:expr) => {{
+    ($t:ty, $val:expr) => {{
         static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-        #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
-        x
+        #[allow(unsafe_code)]
+        unsafe {
+            STATIC_CELL.init_with(|| $val)
+        }
     }};
 }
 
 // WiFi credentials - in production, these should come from secure storage
 const SSID: &str = env!("SSID", "WiFi SSID must be set via environment variable");
-const PASSWORD: &str = env!("PASSWORD", "WiFi password must be set via environment variable");
+const PASSWORD: &str = env!(
+    "PASSWORD",
+    "WiFi password must be set via environment variable"
+);
 const MCP_PORT: u16 = 3000;
+
+// LED command channel - global static for inter-task communication
+static LED_CHANNEL: Channel<CriticalSectionRawMutex, LedCommand, 4> = Channel::new();
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) -> ! {
@@ -56,7 +71,7 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    // Increased heap size for networking and JSON processing
+    // Heap size optimized for ESP32-C6 memory constraints (512KB SRAM total)
     esp_alloc::heap_allocator!(size: 128 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
@@ -69,6 +84,15 @@ async fn main(spawner: Spawner) -> ! {
 
     let (controller, interfaces) = esp_wifi::wifi::new(&esp_wifi_ctrl, peripherals.WIFI).unwrap();
     let wifi_interface = interfaces.sta;
+
+    // Initialize SmartLED (NeoPixel) on GPIO8
+    let led_pin = peripherals.GPIO8;
+    let freq = esp_hal::time::Rate::from_mhz(80);
+    let rmt = Rmt::new(peripherals.RMT, freq).unwrap();
+    let rmt_buffer = smart_led_buffer!(1);
+    let led = SmartLedsAdapter::new(rmt.channel0, led_pin, rmt_buffer);
+
+    info!("SmartLED initialized on GPIO8");
 
     let systimer = SystemTimer::new(peripherals.SYSTIMER);
     esp_hal_embassy::init(systimer.alarm0);
@@ -83,8 +107,26 @@ async fn main(spawner: Spawner) -> ! {
         mk_static!(StackResources<3>, StackResources::<3>::new()),
         seed,
     );
-    
+
     let stack = mk_static!(Stack<'static>, stack);
+
+    // Create static LED for hardware task
+    let led_static = mk_static!(
+        SmartLedsAdapter<ConstChannelAccess<esp_hal::rmt::Tx, 0>, 25>,
+        led
+    );
+
+    // Set up LED sender for MCP communication - create static reference
+    let sender_static = mk_static!(
+        embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, LedCommand, 4>,
+        LED_CHANNEL.sender()
+    );
+    set_led_sender(sender_static);
+
+    // Spawn hardware task for LED control
+    spawner
+        .spawn(led_hardware_task(led_static, LED_CHANNEL.receiver()))
+        .ok();
 
     spawner.spawn(connection_task(controller)).ok();
     spawner.spawn(net_task(runner)).ok();
@@ -124,11 +166,13 @@ async fn main(spawner: Spawner) -> ! {
 async fn connection_task(mut controller: WifiController<'static>) {
     info!("WiFi connection task started");
     info!("Device capabilities: {:?}", controller.capabilities());
-    
+
     // https://docs.esp-rs.org/esp-hal/esp-wifi/0.12.0/esp32c6/esp_wifi/#wifi-performance-considerations
     info!("Disabling PowerSaveMode to avoid delay when receiving data.");
-    controller.set_power_saving(esp_wifi::config::PowerSaveMode::None).unwrap();
-    
+    controller
+        .set_power_saving(esp_wifi::config::PowerSaveMode::None)
+        .unwrap();
+
     loop {
         match esp_wifi::wifi::wifi_state() {
             WifiState::StaConnected => {
@@ -138,7 +182,7 @@ async fn connection_task(mut controller: WifiController<'static>) {
             }
             _ => {}
         }
-        
+
         if !matches!(controller.is_started(), Ok(true)) {
             let client_config = Configuration::Client(ClientConfiguration {
                 ssid: SSID.into(),
@@ -150,7 +194,7 @@ async fn connection_task(mut controller: WifiController<'static>) {
             controller.start_async().await.unwrap();
             info!("WiFi started!");
         }
-        
+
         info!("Attempting to connect to WiFi...");
         match controller.connect_async().await {
             Ok(_) => info!("Successfully connected to WiFi!"),
@@ -170,7 +214,7 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
 #[embassy_executor::task]
 async fn mcp_server_task(stack: &'static Stack<'static>) {
     info!("MCP server task starting...");
-    
+
     loop {
         // Wait until we have an IP address
         if stack.config_v4().is_none() {
@@ -178,22 +222,60 @@ async fn mcp_server_task(stack: &'static Stack<'static>) {
             continue;
         }
 
-        // Create fresh buffers for each connection
+        // TCP buffers sized for ESP32-C6 memory constraints but large enough for responses
         let mut rx_buffer = [0; 4096];
         let mut tx_buffer = [0; 4096];
         let mut socket = TcpSocket::new(*stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(30)));
 
         info!("MCP server listening on port {}...", MCP_PORT);
-        
+
         match socket.accept(MCP_PORT).await {
             Ok(()) => {
                 info!("MCP client connected!");
-                
+
+                // Turn LED green to indicate MCP client is connected
+                if let Err(e) = LED_CHANNEL.sender().try_send(LedCommand::SetColor {
+                    r: 0,
+                    g: 255,
+                    b: 0,
+                    brightness: 20,
+                }) {
+                    warn!("Failed to set LED to green: {:?}", e);
+                } else {
+                    info!("LED set to green - MCP client connected");
+                }
+
                 // Handle the connection
                 match handle_mcp_connection(&mut socket).await {
-                    Ok(()) => info!("MCP client disconnected normally"),
-                    Err(e) => error!("MCP connection error: {:?}", e),
+                    Ok(()) => {
+                        info!("MCP client disconnected normally");
+                        // Turn LED back to blue when client disconnects
+                        if let Err(e) = LED_CHANNEL.sender().try_send(LedCommand::SetColor {
+                            r: 0,
+                            g: 0,
+                            b: 255,
+                            brightness: 20,
+                        }) {
+                            warn!("Failed to set LED back to blue: {:?}", e);
+                        } else {
+                            info!("LED set back to blue - MCP client disconnected");
+                        }
+                    }
+                    Err(e) => {
+                        error!("MCP connection error: {:?}", e);
+                        // Turn LED back to blue on error too
+                        if let Err(e) = LED_CHANNEL.sender().try_send(LedCommand::SetColor {
+                            r: 0,
+                            g: 0,
+                            b: 255,
+                            brightness: 20,
+                        }) {
+                            warn!("Failed to set LED back to blue after error: {:?}", e);
+                        } else {
+                            info!("LED set back to blue after connection error");
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -204,19 +286,17 @@ async fn mcp_server_task(stack: &'static Stack<'static>) {
     }
 }
 
-async fn handle_mcp_connection<T: Read + Write>(
-    socket: &mut T,
-) -> Result<(), T::Error>
+async fn handle_mcp_connection<T: Read + Write>(socket: &mut T) -> Result<(), T::Error>
 where
     T::Error: core::fmt::Debug,
 {
     let mut buffer = [0u8; MAX_JSON_SIZE];
     let mut response_buf = [0u8; MAX_JSON_SIZE];
     let mut pending_data = String::new();
-    
+
     loop {
         info!("Waiting for MCP request...");
-        
+
         // Read new data from socket
         match socket.read(&mut buffer).await {
             Ok(0) => {
@@ -225,7 +305,7 @@ where
             }
             Ok(n) => {
                 info!("Received {} bytes of data", n);
-                
+
                 // Convert to string and add to pending data
                 match core::str::from_utf8(&buffer[..n]) {
                     Ok(new_data) => {
@@ -236,18 +316,18 @@ where
                         continue;
                     }
                 }
-                
+
                 // Process all complete messages (separated by newlines)
                 while let Some(newline_pos) = pending_data.find('\n') {
                     let message = pending_data[..newline_pos].trim().to_string();
                     pending_data = pending_data[newline_pos + 1..].to_string();
-                    
+
                     if message.is_empty() {
                         continue;
                     }
-                    
+
                     info!("Processing message ({}bytes): {}", message.len(), message);
-                    
+
                     // Process this complete message
                     if let Err(e) = process_mcp_message(socket, &message, &mut response_buf).await {
                         error!("Error processing message: {:?}", e);
@@ -272,123 +352,192 @@ where
     T::Error: core::fmt::Debug,
 {
     info!("Attempting to parse JSON...");
-    
+
     // Parse and handle MCP request
     match serde_json_core::from_str::<McpRequest>(request_str) {
-            Ok((request, _)) => {
-                info!("Successfully parsed MCP request: method={}", request.method.as_str());
-                
-                // Check if this is a notification (no id field)
-                if request.id.is_none() {
-                    info!("Processing notification: {}", request.method.as_str());
-                    
-                    // For notifications, just handle them but don't send a response
-                    match request.method.as_str() {
-                        "notifications/initialized" => {
-                            info!("Client initialization notification received - connection ready");
-                        }
-                        _ => {
-                            warn!("Unknown notification method: {}", request.method.as_str());
-                        }
+        Ok((request, _)) => {
+            info!(
+                "Successfully parsed MCP request: method={}",
+                request.method.as_str()
+            );
+
+            // Check if this is a notification (no id field)
+            if request.id.is_none() {
+                info!("Processing notification: {}", request.method.as_str());
+
+                // For notifications, just handle them but don't send a response
+                match request.method.as_str() {
+                    "notifications/initialized" => {
+                        info!("Client initialization notification received - connection ready");
                     }
-                    
-                    // Return without sending a response for notifications
-                    return Ok(());
-                }
-                
-                let response = handle_mcp_request(&request, request_str);
-                
-                // Manually construct JSON to avoid double-encoding the result field
-                let response_str = if let Some(ref result) = response.result {
-                    // Construct JSON with raw result (not escaped)
-                    let id_str = match response.id {
-                        Some(id) => id.to_string(),
-                        None => "null".to_string(),
-                    };
-                    let mut response_json = String::new();
-                    response_json.push_str("{\"jsonrpc\":\"");
-                    response_json.push_str(response.jsonrpc.as_str());
-                    response_json.push_str("\",\"id\":");
-                    response_json.push_str(&id_str);
-                    response_json.push_str(",\"result\":");
-                    response_json.push_str(result);
-                    response_json.push_str("}");
-                    response_json
-                } else if let Some(ref error) = response.error {
-                    // Serialize error normally
-                    match serde_json_core::to_string::<_, MAX_JSON_SIZE>(&error) {
-                        Ok(error_json) => {
-                            let id_str = match response.id {
-                                Some(id) => id.to_string(),
-                                None => "null".to_string(),
-                            };
-                            let mut response_json = String::new();
-                            response_json.push_str("{\"jsonrpc\":\"");
-                            response_json.push_str(response.jsonrpc.as_str());
-                            response_json.push_str("\",\"id\":");
-                            response_json.push_str(&id_str);
-                            response_json.push_str(",\"error\":");
-                            response_json.push_str(&error_json);
-                            response_json.push_str("}");
-                            response_json
-                        },
-                        Err(e) => {
-                            error!("Failed to serialize error: {:?}", e);
-                            return Ok(());
-                        }
+                    _ => {
+                        warn!("Unknown notification method: {}", request.method.as_str());
                     }
-                } else {
-                    return Ok(()); // Invalid response
-                };
-                
-                info!("Successfully constructed response ({}bytes)", response_str.len());
-                
-                info!("Sending MCP response: {}", response_str);
-                
-                // Send response
-                response_buf[..response_str.len()].copy_from_slice(response_str.as_bytes());
-                response_buf[response_str.len()] = b'\n';
-                
-                if let Err(e) = socket.write_all(&response_buf[..response_str.len() + 1]).await {
-                    error!("Write error: {:?}", e);
-                    return Err(e);
                 }
-                
-                // CRITICAL: Flush the socket to ensure data is actually sent
-                if let Err(e) = socket.flush().await {
-                    error!("Flush error: {:?}", e);
-                    return Err(e);
-                }
-                
-                // Give client time to receive the response before potentially closing connection
-                Timer::after(Duration::from_millis(10)).await;
-                
-                info!("Response sent and flushed successfully");
+
+                // Return without sending a response for notifications
+                return Ok(());
             }
-            Err(e) => {
-                error!("JSON parse failed: {:?}", e);
-                error!("Raw request bytes: {:?}", request_str.as_bytes());
-                
-                // Send error response
-                let error_response = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}\n"#;
-                info!("Sending error response: {}", error_response);
-                
-                if let Err(e) = socket.write_all(error_response.as_bytes()).await {
-                    error!("Write error: {:?}", e);
-                    return Err(e);
+
+            let response = handle_mcp_request(&request, request_str);
+
+            // Manually construct JSON to avoid double-encoding the result field
+            let response_str = if let Some(ref result) = response.result {
+                // Construct JSON with raw result (not escaped)
+                let id_str = match response.id {
+                    Some(id) => id.to_string(),
+                    None => "null".to_string(),
+                };
+                let mut response_json = String::new();
+                response_json.push_str("{\"jsonrpc\":\"");
+                response_json.push_str(response.jsonrpc.as_str());
+                response_json.push_str("\",\"id\":");
+                response_json.push_str(&id_str);
+                response_json.push_str(",\"result\":");
+                response_json.push_str(result);
+                response_json.push_str("}");
+                response_json
+            } else if let Some(ref error) = response.error {
+                // Serialize error normally
+                match serde_json_core::to_string::<_, MAX_JSON_SIZE>(&error) {
+                    Ok(error_json) => {
+                        let id_str = match response.id {
+                            Some(id) => id.to_string(),
+                            None => "null".to_string(),
+                        };
+                        let mut response_json = String::new();
+                        response_json.push_str("{\"jsonrpc\":\"");
+                        response_json.push_str(response.jsonrpc.as_str());
+                        response_json.push_str("\",\"id\":");
+                        response_json.push_str(&id_str);
+                        response_json.push_str(",\"error\":");
+                        response_json.push_str(&error_json);
+                        response_json.push_str("}");
+                        response_json
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize error: {:?}", e);
+                        return Ok(());
+                    }
                 }
-                
-                // CRITICAL: Flush the socket to ensure error response is actually sent
-                if let Err(e) = socket.flush().await {
-                    error!("Error response flush error: {:?}", e);
-                    return Err(e);
-                }
-                
-                // Give client time to receive the error response
-                Timer::after(Duration::from_millis(10)).await;
-                
-                info!("Error response sent and flushed successfully");
+            } else {
+                return Ok(()); // Invalid response
+            };
+
+            info!(
+                "Successfully constructed response ({}bytes)",
+                response_str.len()
+            );
+
+            // Safety check: ensure response fits in buffer
+            if response_str.len() >= MAX_JSON_SIZE {
+                error!(
+                    "Response too large ({} bytes), exceeds buffer size ({})",
+                    response_str.len(),
+                    MAX_JSON_SIZE
+                );
+                return Ok(()); // Drop this response to prevent crash
+            }
+
+            info!("Sending MCP response: {}", response_str);
+
+            // Send response
+            response_buf[..response_str.len()].copy_from_slice(response_str.as_bytes());
+            response_buf[response_str.len()] = b'\n';
+
+            if let Err(e) = socket
+                .write_all(&response_buf[..response_str.len() + 1])
+                .await
+            {
+                error!("Write error: {:?}", e);
+                return Err(e);
+            }
+
+            // CRITICAL: Flush the socket to ensure data is actually sent
+            if let Err(e) = socket.flush().await {
+                error!("Flush error: {:?}", e);
+                return Err(e);
+            }
+
+            // Give client time to receive the response before potentially closing connection
+            Timer::after(Duration::from_millis(10)).await;
+
+            info!("Response sent and flushed successfully");
+        }
+        Err(e) => {
+            error!("JSON parse failed: {:?}", e);
+            error!("Raw request bytes: {:?}", request_str.as_bytes());
+
+            // Send error response
+            let error_response =
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}\n"#;
+            info!("Sending error response: {}", error_response);
+
+            if let Err(e) = socket.write_all(error_response.as_bytes()).await {
+                error!("Write error: {:?}", e);
+                return Err(e);
+            }
+
+            // CRITICAL: Flush the socket to ensure error response is actually sent
+            if let Err(e) = socket.flush().await {
+                error!("Error response flush error: {:?}", e);
+                return Err(e);
+            }
+
+            // Give client time to receive the error response
+            Timer::after(Duration::from_millis(10)).await;
+
+            info!("Error response sent and flushed successfully");
+        }
+    }
+    Ok(())
+}
+
+#[embassy_executor::task]
+async fn led_hardware_task(
+    led: &'static mut SmartLedsAdapter<ConstChannelAccess<esp_hal::rmt::Tx, 0>, 25>,
+    receiver: embassy_sync::channel::Receiver<'static, CriticalSectionRawMutex, LedCommand, 4>,
+) {
+    info!("LED hardware task started");
+
+    // Initialize with blue color to indicate system is ready
+    let init_color = RGB8 { r: 0, g: 0, b: 255 };
+    led.write(brightness(gamma(core::iter::once(init_color)), 20))
+        .unwrap();
+
+    info!("LED set to blue - system ready");
+
+    loop {
+        let command = receiver.receive().await;
+
+        match command {
+            LedCommand::SetColor {
+                r,
+                g,
+                b,
+                brightness: brightness_percent,
+            } => {
+                info!(
+                    "Setting LED to RGB({}, {}, {}) with {}% brightness",
+                    r, g, b, brightness_percent
+                );
+
+                let color = RGB8 { r, g, b };
+                let brightness_val = (brightness_percent as u8).min(100);
+
+                led.write(brightness(gamma(core::iter::once(color)), brightness_val))
+                    .unwrap();
+            }
+            LedCommand::Off => {
+                info!("Turning LED off");
+
+                let off_color = RGB8 { r: 0, g: 0, b: 0 };
+                led.write(brightness(gamma(core::iter::once(off_color)), 0))
+                    .unwrap();
             }
         }
-    Ok(())
+
+        // Small delay to prevent overwhelming the LED controller
+        Timer::after(Duration::from_millis(10)).await;
+    }
 }

@@ -63,6 +63,13 @@ serde-json-core = "0.6.0"
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 heapless = { version = "0.8.0", features = ["serde"] }
 
+# SmartLED support
+esp-hal-smartled = { git = "https://github.com/esp-rs/esp-hal-community.git", rev = "bbe8484", features = ["esp32c6"] }
+smart-leds = "0.4.0"
+
+# Embassy sync for hardware task communication
+embassy-sync = "0.7.0"
+
 
 [profile.dev]
 # Rust debug is too slow.
